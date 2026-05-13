@@ -1,0 +1,1530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>O&D Offer Simulation</title>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;600;700&display=swap" rel="stylesheet" />
+  <!-- React + Babel via CDN — no build step needed -->
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'IBM Plex Sans', sans-serif; background: #f8fafc; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+import { useState, useMemo, useRef, useEffect } from "react";
+
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+const LEGS = [
+  { id: "LAXDFW", kms: 1985 },
+  { id: "ABQDFW", kms: 920 },
+  { id: "DFWBOS", kms: 2510 },
+  { id: "DFWEZE", kms: 8500 },
+  { id: "DFWAUS", kms: 310 },
+];
+
+// Real AA economy fare ranges per leg (from aa.com / Expedia May 2026)
+// basic = Basic Economy, main = Main Cabin, flex = Main Cabin flexible/refundable
+const LEG_FARES = {
+  LAXDFW: { basic: [130, 165], main: [200, 310], flex: [320, 500] },
+  ABQDFW: { basic: [95,  120], main: [160, 240], flex: [260, 420] },
+  DFWBOS: { basic: [150, 200], main: [240, 340], flex: [360, 530] },
+  DFWEZE: { basic: [520, 700], main: [750,1050], flex:[1100,1600] },
+  DFWAUS: { basic: [39,   60], main: [ 80, 130], flex: [150, 240] },
+};
+
+// Possible itineraries (O&D) that touch these legs
+const OD_ITINERARIES = [
+  { legs: ["LAXDFW"] },
+  { legs: ["ABQDFW"] },
+  { legs: ["DFWBOS"] },
+  { legs: ["DFWEZE"] },
+  { legs: ["DFWAUS"] },
+  { legs: ["LAXDFW", "DFWBOS"] },
+  { legs: ["LAXDFW", "DFWEZE"] },
+  { legs: ["LAXDFW", "DFWAUS"] },
+  { legs: ["ABQDFW", "DFWBOS"] },
+  { legs: ["ABQDFW", "DFWEZE"] },
+  { legs: ["ABQDFW", "DFWAUS"] },
+];
+
+function sqrtProRatio(legId, itinLegIds) {
+  const legKms = (id) => LEGS.find((l) => l.id === id)?.kms ?? 0;
+  const totalSqrt = itinLegIds.reduce((s, id) => s + Math.sqrt(legKms(id)), 0);
+  return Math.sqrt(legKms(legId)) / totalSqrt;
+}
+
+// ─── SIMULATION SEED ──────────────────────────────────────────────────────────
+function seededRand(seed) {
+  let s = seed;
+  return () => {
+    s = (s * 1664525 + 1013904223) & 0xffffffff;
+    return (s >>> 0) / 0xffffffff;
+  };
+}
+
+const STATUS_CONFIG = [
+  { status: "FULL",               count: 1, lfMin: 1.00, lfMax: 1.10, color: "#ef4444", bg: "#fef2f2", sopMin: 0.96, sopMax: 0.99 },
+  { status: "POTENTIAL_SPILL",    count: 1, lfMin: 0.95, lfMax: 0.99, color: "#f97316", bg: "#fff7ed", sopMin: 0.80, sopMax: 0.90 },
+  { status: "POTENTIAL_SPOILAGE", count: 3, lfMin: 0.50, lfMax: 0.79, color: "#3b82f6", bg: "#eff6ff", sopMin: 0.20, sopMax: 0.60 },
+  { status: "UNCLASSIFIED",       count: 1, lfMin: 0.80, lfMax: 0.94, color: "#8b5cf6", bg: "#f5f3ff", sopMin: 0.60, sopMax: 0.80 },
+];
+
+// Fare mix per status — Economy only (basic + main + flex), NO business class.
+// FULL: basic fares exhausted early → last 5 PAX paid main/flex economy
+// POTENTIAL_SPILL: mostly main/flex, small basic remnant
+// UNCLASSIFIED: balanced main-heavy mix
+// POTENTIAL_SPOILAGE: airline discounting → last 5 PAX overwhelmingly basic
+const STATUS_FARE_MIX = {
+  FULL:               [{ tier: "flex",  w: 0.55 }, { tier: "main",  w: 0.40 }, { tier: "basic", w: 0.05 }],
+  POTENTIAL_SPILL:    [{ tier: "flex",  w: 0.35 }, { tier: "main",  w: 0.50 }, { tier: "basic", w: 0.15 }],
+  UNCLASSIFIED:       [{ tier: "flex",  w: 0.15 }, { tier: "main",  w: 0.55 }, { tier: "basic", w: 0.30 }],
+  POTENTIAL_SPOILAGE: [{ tier: "basic", w: 0.80 }, { tier: "main",  w: 0.20 }],
+};
+
+function pickFareTier(status, rand) {
+  const mix = STATUS_FARE_MIX[status];
+  const r = rand();
+  let cum = 0;
+  for (const { tier, w } of mix) { cum += w; if (r < cum) return tier; }
+  return mix[mix.length - 1].tier;
+}
+
+function sampleLegFare(legId, tier, rand) {
+  const [lo, hi] = LEG_FARES[legId][tier];
+  return Math.round(lo + rand() * (hi - lo));
+}
+
+// For connecting PAX: compute OD price by summing per-leg fares at sampled tier
+function odFareFromLegs(legIds, tier, rand) {
+  return legIds.reduce((s, id) => s + sampleLegFare(id, tier, rand), 0);
+}
+
+function simulateFlights(seed = 42) {
+  const rand = seededRand(seed);
+  const flights = [];
+  let fid = 1;
+
+  for (const leg of LEGS) {
+    const totalCap = 150 + Math.round(rand() * 50);
+    const statusSlots = [];
+    for (const sc of STATUS_CONFIG) {
+      for (let i = 0; i < sc.count; i++) statusSlots.push(sc);
+    }
+    for (let i = statusSlots.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1));
+      [statusSlots[i], statusSlots[j]] = [statusSlots[j], statusSlots[i]];
+    }
+
+    for (const sc of statusSlots) {
+      const lf = sc.lfMin + rand() * (sc.lfMax - sc.lfMin);
+      const reservations = Math.round(lf * totalCap);
+
+      // Generate last 5 passengers — itinerary + price correlated with flight status
+      const compatibleODs = OD_ITINERARIES.filter((od) => od.legs.includes(leg.id));
+      const last5 = Array.from({ length: 5 }, (_, i) => {
+        const od = compatibleODs[Math.floor(rand() * compatibleODs.length)];
+        const tier = pickFareTier(sc.status, rand);
+        // OD price = sum of each leg's fare at that tier (realistic connecting fare build-up)
+        const odPrice = odFareFromLegs(od.legs, tier, rand);
+        const ratio = sqrtProRatio(leg.id, od.legs);
+        return {
+          pax: i + 1,
+          od: od.legs.join("-"),
+          tier,
+          odPrice,
+          ratio,
+          contribution: odPrice * ratio,
+        };
+      });
+
+      const marketValue = last5.reduce((s, p) => s + p.contribution, 0) / last5.length;
+
+      // Sold-out probability: sampled within status band, then nudged by actual LF position within band
+      const lfNorm = sc.lfMax > sc.lfMin
+        ? Math.min((lf - sc.lfMin) / (sc.lfMax - sc.lfMin), 1)
+        : 0.5;
+      const sopRaw = sc.sopMin + lfNorm * (sc.sopMax - sc.sopMin);
+      // small random jitter ±1.5pp to avoid perfectly linear values
+      const sopJitter = (rand() - 0.5) * 0.03;
+      const soldOutProb = Math.min(Math.max(sopRaw + sopJitter, sc.sopMin), sc.sopMax);
+
+      flights.push({
+        id: `FL${String(fid++).padStart(3, "0")}`,
+        leg: leg.id,
+        kms: leg.kms,
+        totalCap,
+        reservations,
+        lf: Math.min(lf, 1.1),
+        status: sc.status,
+        color: sc.color,
+        bg: sc.bg,
+        last5,
+        marketValue: Math.round(marketValue * 100) / 100,
+        soldOutProb: Math.round(soldOutProb * 1000) / 1000,
+      });
+    }
+
+    // ── Synthetic extra POTENTIAL_SPOILAGE flight (guarantees swap candidate always exists) ──
+    const legSpoilage = flights.filter(f => f.leg === leg.id && f.status === "POTENTIAL_SPOILAGE");
+    if (legSpoilage.length > 0) {
+      const minResv      = Math.min(...legSpoilage.map(f => f.reservations));
+      const minMV        = Math.min(...legSpoilage.map(f => f.marketValue));
+      const minSOP       = Math.min(...legSpoilage.map(f => f.soldOutProb));
+      const syntheticSOP = Math.round(0.5 * minSOP * 1000) / 1000;
+      const sc           = STATUS_CONFIG.find(s => s.status === "POTENTIAL_SPOILAGE");
+      flights.push({
+        id:           `FL${String(fid++).padStart(3, "0")}S`,
+        leg:          leg.id,
+        kms:          leg.kms,
+        totalCap:     flights.find(f => f.leg === leg.id)?.totalCap ?? 150,
+        reservations: minResv,
+        lf:           minResv / (flights.find(f => f.leg === leg.id)?.totalCap ?? 150),
+        status:       "POTENTIAL_SPOILAGE",
+        color:        sc.color,
+        bg:           sc.bg,
+        last5:        [],
+        marketValue:  minMV,
+        soldOutProb:  syntheticSOP,
+        synthetic:    true,
+      });
+    }
+  }
+  return flights;
+}
+
+// ─── COMPONENTS ───────────────────────────────────────────────────────────────
+const statusOrder = ["FULL","POTENTIAL_SPILL","UNCLASSIFIED","POTENTIAL_SPOILAGE"];
+
+function LFBar({ lf, color }) {
+  const pct = Math.min(lf * 100, 100);
+  return (
+    <div style={{ position: "relative", height: 8, background: "#e5e7eb", borderRadius: 4, overflow: "hidden" }}>
+      <div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: `${pct}%`, background: color, borderRadius: 4, transition: "width 0.4s" }} />
+      {lf >= 0.95 && (
+        <div style={{ position: "absolute", left: "95%", top: -2, height: 12, width: 2, background: "#374151" }} />
+      )}
+    </div>
+  );
+}
+
+function StatusBadge({ status, color, bg }) {
+  return (
+    <span style={{
+      fontSize: 10, fontWeight: 700, letterSpacing: "0.05em",
+      padding: "2px 8px", borderRadius: 999,
+      background: bg, color: color, border: `1px solid ${color}30`,
+      whiteSpace: "nowrap",
+    }}>
+      {status.replace("_", " ")}
+    </span>
+  );
+}
+
+function PAXModal({ flight, onClose }) {
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "#00000080", zIndex: 100,
+      display: "flex", alignItems: "center", justifyContent: "center"
+    }} onClick={onClose}>
+      <div style={{
+        background: "#fff", borderRadius: 16, padding: 28, minWidth: 480, maxWidth: 560,
+        boxShadow: "0 20px 60px #0003", fontFamily: "'IBM Plex Mono', monospace"
+      }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: "#111" }}>{flight.id} · {flight.leg}</div>
+            <div style={{ fontSize: 12, color: "#6b7280" }}>Last 5 PAX — Market Value breakdown</div>
+          </div>
+          <button onClick={onClose} style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: "#9ca3af" }}>✕</button>
+        </div>
+
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+          <thead>
+            <tr style={{ borderBottom: "2px solid #e5e7eb" }}>
+              {["PAX","Itinerary","Tier","OD Price","√ Ratio","→ Contribution"].map(h => (
+                <th key={h} style={{ padding: "6px 8px", textAlign: "right", color: "#6b7280", fontWeight: 600, fontSize: 11 }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {flight.last5.map((p, i) => {
+              const tierColor = { flex:"#0284c7", main:"#0891b2", basic:"#64748b" }[p.tier] || "#64748b";
+              return (
+              <tr key={i} style={{ borderBottom: "1px solid #f3f4f6" }}>
+                <td style={{ padding: "8px", color: "#374151", textAlign: "right" }}>#{p.pax}</td>
+                <td style={{ padding: "8px", color: "#111", fontWeight: 600, textAlign: "right", fontFamily:"monospace", fontSize:11 }}>{p.od}</td>
+                <td style={{ padding: "8px", textAlign: "right" }}>
+                  <span style={{ fontSize:10, fontWeight:700, padding:"1px 6px", borderRadius:999, background: tierColor+"18", color: tierColor, border:`1px solid ${tierColor}40` }}>{p.tier.toUpperCase()}</span>
+                </td>
+                <td style={{ padding: "8px", color: "#374151", textAlign: "right" }}>${p.odPrice.toLocaleString()}</td>
+                <td style={{ padding: "8px", color: "#6366f1", textAlign: "right" }}>{(p.ratio * 100).toFixed(1)}%</td>
+                <td style={{ padding: "8px", color: "#059669", fontWeight: 700, textAlign: "right" }}>${p.contribution.toFixed(2)}</td>
+              </tr>
+            )})}
+          </tbody>
+          <tfoot>
+            <tr style={{ borderTop: "2px solid #e5e7eb" }}>
+              <td colSpan={5} style={{ padding: "10px 8px", fontWeight: 700, color: "#111", textAlign: "right" }}>Avg Market Value</td>
+              <td style={{ padding: "10px 8px", fontWeight: 800, color: "#059669", textAlign: "right", fontSize: 15 }}>
+                ${flight.marketValue.toFixed(2)}
+              </td>
+            </tr>
+          </tfoot>
+        </table>
+
+        <div style={{ marginTop: 16, padding: "10px 14px", background: "#f8fafc", borderRadius: 8, fontSize: 11, color: "#64748b", lineHeight: 1.6 }}>
+          <strong>√ Ratio formula:</strong> √(leg_kms) / Σ√(leg_kms for all legs in itinerary)<br />
+          Contribution = OD Price × √ProRatio for this leg
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FlightRow({ f, onClick }) {
+  return (
+    <tr
+      onClick={() => onClick(f)}
+      style={{ cursor: "pointer", borderBottom: "1px solid #f1f5f9", transition: "background 0.15s" }}
+      onMouseEnter={e => e.currentTarget.style.background = "#f8fafc"}
+      onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+    >
+      <td style={{ padding: "9px 8px", fontWeight: 700, color: "#1e293b", fontFamily: "monospace", fontSize: 12, whiteSpace: "nowrap" }}>{f.id}</td>
+      <td style={{ padding: "9px 8px", fontWeight: 700, fontSize: 13 }}>{f.leg}</td>
+      <td style={{ padding: "9px 8px", color: "#64748b", textAlign: "right", fontSize: 12 }}>{f.kms.toLocaleString()}</td>
+      <td style={{ padding: "9px 8px", textAlign: "right", fontSize: 12 }}>{f.totalCap}</td>
+      <td style={{ padding: "9px 8px", textAlign: "right", fontSize: 12 }}>{f.reservations}</td>
+      <td style={{ padding: "9px 8px", width: 140 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <div style={{ flex: 1, minWidth: 70 }}><LFBar lf={f.lf} color={f.color} /></div>
+          <span style={{ fontSize: 11, fontWeight: 700, color: f.color, minWidth: 38, textAlign: "right" }}>
+            {(Math.min(f.lf, 1) * 100).toFixed(1)}%
+          </span>
+        </div>
+      </td>
+      <td style={{ padding: "9px 8px" }}><StatusBadge status={f.status} color={f.color} bg={f.bg} /></td>
+      <td style={{ padding: "9px 8px", textAlign: "right", fontWeight: 800, color: "#059669", fontFamily: "monospace", fontSize: 14, whiteSpace: "nowrap" }}>
+        ${f.marketValue.toFixed(2)}
+      </td>
+      <td style={{ padding: "9px 8px", minWidth: 120 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <div style={{ flex: 1, height: 6, background: "#e5e7eb", borderRadius: 3, overflow: "hidden" }}>
+            <div style={{ height: "100%", width: `${f.soldOutProb * 100}%`, background: f.color, borderRadius: 3 }} />
+          </div>
+          <span style={{ fontSize: 11, fontWeight: 700, color: f.color, minWidth: 38, textAlign: "right", fontFamily: "monospace" }}>
+            {(f.soldOutProb * 100).toFixed(1)}%
+          </span>
+        </div>
+      </td>
+      <td style={{ padding: "9px 8px", textAlign: "center", color: "#94a3b8", fontSize: 13 }}>🔍</td>
+    </tr>
+  );
+}
+
+// ─── THRESHOLD & TIER LOOKUP (needed by App, OfferCalculator, ElasticityChart) ──
+function computeLegThresholds(flights) {
+  const result = {};
+  for (const leg of LEGS) {
+    const legFlights = flights.filter(f => f.leg === leg.id);
+    const spoilage   = legFlights.filter(f => f.status === "POTENTIAL_SPOILAGE");
+    const highStatus = legFlights.filter(f => f.status === "FULL" || f.status === "POTENTIAL_SPILL");
+    const avgSpoilage = spoilage.length
+      ? spoilage.reduce((s, f) => s + f.marketValue, 0) / spoilage.length : 0;
+    const floor   = 0.70 * avgSpoilage;
+    const ceiling = highStatus.length
+      ? Math.max(...highStatus.map(f => f.marketValue)) : avgSpoilage * 3;
+    const step = (ceiling - floor) / N_TIERS;
+    const boundaries = Array.from({ length: N_TIERS }, (_, i) => Math.round(floor + (i + 1) * step));
+    result[leg.id] = { floor: Math.round(floor), ceiling: Math.round(ceiling), boundaries, step };
+  }
+  return result;
+}
+
+function getFareTierIndex(farePaid, legId, thresholds) {
+  const t = thresholds[legId];
+  if (!t) return 4;
+  for (let i = 0; i < N_TIERS; i++) {
+    if (farePaid <= t.boundaries[i]) return i;
+  }
+  return N_TIERS - 1;
+}
+
+function getFareTier(farePaid, legId, thresholds) {
+  return TIERS[getFareTierIndex(farePaid, legId, thresholds)];
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+function App() {
+  const [selected, setSelected] = useState(null);
+  const [filterLeg, setFilterLeg] = useState("ALL");
+  const [filterStatus, setFilterStatus] = useState("ALL");
+  const [sortBy, setSortBy] = useState("leg");
+
+  const flights = useMemo(() => simulateFlights(42), []);
+
+  const filtered = useMemo(() => {
+    let f = flights;
+    if (filterLeg !== "ALL") f = f.filter(x => x.leg === filterLeg);
+    if (filterStatus !== "ALL") f = f.filter(x => x.status === filterStatus);
+    return [...f].sort((a, b) => {
+      if (sortBy === "leg") return a.leg.localeCompare(b.leg) || statusOrder.indexOf(a.status) - statusOrder.indexOf(b.status);
+      if (sortBy === "mv") return b.marketValue - a.marketValue;
+      if (sortBy === "lf") return b.lf - a.lf;
+      return 0;
+    });
+  }, [flights, filterLeg, filterStatus, sortBy]);
+
+  // Summary stats
+  const summary = useMemo(() => {
+    const byStatus = {};
+    for (const sc of STATUS_CONFIG) byStatus[sc.status] = { count: 0, mv: 0, color: sc.color };
+    for (const f of flights) { byStatus[f.status].count++; byStatus[f.status].mv += f.marketValue; }
+    return byStatus;
+  }, [flights]);
+
+  const thresholds = useMemo(() => computeLegThresholds(flights), [flights]);
+
+  const selBtn = (val, cur, set) => ({
+    padding: "5px 12px", borderRadius: 6, fontSize: 12, fontWeight: 600,
+    cursor: "pointer", border: "1px solid",
+    background: val === cur ? "#1e293b" : "#fff",
+    color: val === cur ? "#fff" : "#64748b",
+    borderColor: val === cur ? "#1e293b" : "#e2e8f0",
+    transition: "all 0.15s",
+  });
+
+  return (
+    <div style={{ fontFamily: "'IBM Plex Sans', sans-serif", background: "#f8fafc", minHeight: "100vh", padding: "16px 12px" }}>
+      {/* Header */}
+      <div style={{ marginBottom: 24 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 4 }}>
+          <h1 style={{ margin: 0, fontSize: 26, fontWeight: 800, color: "#0f172a", letterSpacing: "-0.02em" }}>
+            ✈ Flight Market Value Simulator
+          </h1>
+          <span style={{ fontSize: 12, color: "#94a3b8", fontFamily: "monospace" }}>seed=42 · 30 flights · √ProRatio</span>
+        </div>
+        <p style={{ margin: 0, fontSize: 13, color: "#64748b" }}>
+          Market Value = avg contribution of last 5 PAX per leg using √(km) pro-ration across itinerary legs
+        </p>
+      </div>
+
+      {/* Filters */}
+      <div style={{ background: "#fff", borderRadius: 12, padding: "14px 18px", marginBottom: 16, display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap", boxShadow: "0 1px 4px #0001" }}>
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span style={{ fontSize: 12, color: "#64748b", fontWeight: 600 }}>LEG</span>
+          {["ALL", ...LEGS.map(l => l.id)].map(v => (
+            <button key={v} style={selBtn(v, filterLeg, setFilterLeg)} onClick={() => setFilterLeg(v)}>{v}</button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 6, alignItems: "center", marginLeft: "auto" }}>
+          <span style={{ fontSize: 12, color: "#64748b", fontWeight: 600 }}>SORT</span>
+          {[["leg","By Leg"],["mv","By MV ↓"],["lf","By LF ↓"]].map(([v,l]) => (
+            <button key={v} style={selBtn(v, sortBy, setSortBy)} onClick={() => setSortBy(v)}>{l}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Table */}
+      <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 1px 4px #0001", overflowX: "auto" }}>
+        <table style={{ width: "100%", minWidth: 760, borderCollapse: "collapse", fontSize: 13 }}>
+          <thead>
+            <tr style={{ background: "#f1f5f9", borderBottom: "2px solid #e2e8f0" }}>
+              {["Flight","Leg","Kms","Cap","Resv","Load Factor","Status","Mkt Value","Sold-Out Prob",""].map((h,i) => (
+                <th key={i} style={{ padding: "9px 8px", textAlign: i >= 2 && i <= 4 ? "right" : i === 7 || i === 8 ? "right" : "left", fontSize: 11, fontWeight: 700, color: "#64748b", letterSpacing: "0.05em", whiteSpace: "nowrap" }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(f => <FlightRow key={f.id} f={f} onClick={setSelected} />)}
+          </tbody>
+        </table>
+        <div style={{ padding: "10px 18px", fontSize: 11, color: "#94a3b8", borderTop: "1px solid #f1f5f9" }}>
+          {filtered.length} of {flights.length} flights shown · Click any row to inspect PAX contributions
+        </div>
+      </div>
+
+      {/* Formula note */}
+      <div style={{ marginTop: 16, padding: "12px 18px", background: "#fffbeb", borderRadius: 10, border: "1px solid #fcd34d", fontSize: 12, color: "#78350f" }}>
+        <strong>√ProRatio formula:</strong> For a PAX travelling itinerary with legs L₁, L₂ … Lₙ paying total price P:<br />
+        <code style={{ fontFamily: "monospace", background: "#fef3c7", padding: "2px 6px", borderRadius: 4 }}>
+          Contribution to leg Lᵢ = P × √(kms_Lᵢ) / [ √(kms_L₁) + √(kms_L₂) + … + √(kms_Lₙ) ]
+        </code>
+        &nbsp;— Market Value per flight = mean contribution of last 5 PAX on that flight.
+      </div>
+
+      <OfferCalculator flights={flights} thresholds={thresholds} />
+
+      {selected && <PAXModal flight={selected} onClose={() => setSelected(null)} />}
+    </div>
+  );
+}
+
+// ─── ELASTICITY CURVE ────────────────────────────────────────────────────────
+// 10 tiers evenly spaced between floor and ceiling of each leg.
+// Sigmoid params interpolate smoothly: lowest tier = low-fare shape, highest = high-fare shape.
+const N_TIERS = 10;
+
+// Endpoint sigmoid shapes (same as original 3-tier anchors)
+const SHAPE_LOW  = { maxConv: 0.04, k: 2.2, mid: 2.2 };
+const SHAPE_HIGH = { maxConv: 0.10, k: 3.5, mid: 1.4 };
+
+// Color spectrum: blue → orange → purple (10 stops)
+const TIER_COLORS = [
+  "#3b82f6","#2563eb","#0ea5e9","#06b6d4","#14b8a6",
+  "#f59e0b","#f97316","#ef4444","#a855f7","#8b5cf6",
+];
+
+// Generate the 10 tier param objects by linear interpolation
+function buildTiers() {
+  return Array.from({ length: N_TIERS }, (_, i) => {
+    const t = i / (N_TIERS - 1);   // 0 → 1
+    return {
+      index:   i,
+      label:   `T${i + 1}`,
+      color:   TIER_COLORS[i],
+      maxConv: SHAPE_LOW.maxConv + t * (SHAPE_HIGH.maxConv - SHAPE_LOW.maxConv),
+      k:       SHAPE_LOW.k       + t * (SHAPE_HIGH.k       - SHAPE_LOW.k),
+      mid:     SHAPE_LOW.mid     + t * (SHAPE_HIGH.mid     - SHAPE_LOW.mid),
+    };
+  });
+}
+const TIERS = buildTiers();   // array of 10, index 0 = lowest fare bucket
+
+function sigmoid(ratio, maxConv, k, mid) {
+  return maxConv / (1 + Math.exp(-k * (ratio - mid)));
+}
+
+// SVG chart dimensions
+const CW = 680, CH = 320, PAD = { top: 24, right: 24, bottom: 52, left: 56 };
+const INNER_W = CW - PAD.left - PAD.right;
+const INNER_H = CH - PAD.top  - PAD.bottom;
+const X_MIN = 0.5, X_MAX = 5.0;
+const Y_MAX = 0.10;
+const ratioToX = r  => PAD.left + ((r - X_MIN) / (X_MAX - X_MIN)) * INNER_W;
+const probToY  = p  => PAD.top  + (1 - p / Y_MAX) * INNER_H;
+const xToRatio = px => X_MIN + ((px - PAD.left) / INNER_W) * (X_MAX - X_MIN);
+
+function buildPath(tier) {
+  const steps = 120;
+  return Array.from({ length: steps + 1 }, (_, i) => {
+    const r = X_MIN + (i / steps) * (X_MAX - X_MIN);
+    const p = sigmoid(r, tier.maxConv, tier.k, tier.mid);
+    return `${i === 0 ? "M" : "L"}${ratioToX(r).toFixed(2)},${probToY(p).toFixed(2)}`;
+  }).join(" ");
+}
+
+function ElasticityChart({ flights }) {
+  const [hoverRatio, setHoverRatio] = useState(null);
+  const svgRef = useRef(null);
+
+  const thresholds = useMemo(() => computeLegThresholds(flights), [flights]);
+
+  function handleSvgMove(e) {
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const px = e.clientX - rect.left;
+    const r  = xToRatio(px * (CW / rect.width));
+    if (r >= X_MIN && r <= X_MAX) setHoverRatio(r);
+    else setHoverRatio(null);
+  }
+
+  const xTicks = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0];
+  const yTicks = [0, 0.02, 0.04, 0.06, 0.08, 0.10];
+
+  return (
+    <div style={{ marginTop: 24, background: "#fff", borderRadius: 16,
+      boxShadow: "0 1px 6px #0002", overflow: "hidden" }}>
+
+      {/* Header */}
+      <div style={{ background: "#0f172a", padding: "16px 22px", display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ fontSize: 18, fontWeight: 800, color: "#fff" }}>📈 Elasticity Curve</div>
+        <div style={{ fontSize: 12, color: "#94a3b8" }}>
+          P(convert) vs Offer Ratio · thresholds derived from flight Market Values · hover to inspect
+        </div>
+      </div>
+
+      <div style={{ padding: "20px 22px", display: "flex", gap: 28, flexWrap: "wrap" }}>
+
+        {/* ── LEFT: per-leg threshold table ── */}
+        <div style={{ minWidth: 260, flex: "0 0 260px" }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b",
+            letterSpacing: "0.07em", marginBottom: 12 }}>DYNAMIC FARE TIERS · PER LEG</div>
+
+          <div style={{ fontSize: 10, color: "#94a3b8", marginBottom: 10, lineHeight: 1.5 }}>
+            Floor = 70% × avg MV (Spoilage)<br />
+            Ceiling = max MV (Full, Spill)<br />
+            10 equal buckets · T1 (lowest) → T10 (highest)
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {LEGS.map(leg => {
+              const t = thresholds[leg.id];
+              if (!t) return null;
+              return (
+                <div key={leg.id} style={{ background: "#f8fafc", borderRadius: 10,
+                  padding: "10px 12px", border: "1px solid #e2e8f0" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
+                    <span style={{ fontFamily: "monospace", fontWeight: 800, fontSize: 12, color: "#0f172a" }}>{leg.id}</span>
+                    <span style={{ fontSize: 10, color: "#94a3b8", fontFamily: "monospace" }}>
+                      ${t.floor} → ${t.ceiling}
+                    </span>
+                  </div>
+                  {/* 10-bucket gradient strip */}
+                  <div style={{ display: "flex", gap: 2 }}>
+                    {TIERS.map((tier, i) => (
+                      <div key={i} style={{ flex: 1, height: 20, background: tier.color,
+                        borderRadius: i === 0 ? "4px 0 0 4px" : i === N_TIERS-1 ? "0 4px 4px 0" : 0,
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        title: `T${i+1}: $${t.boundaries[i-1]??t.floor}–$${t.boundaries[i]}` }}>
+                        <span style={{ fontSize: 7, fontWeight: 800, color: "#fff",
+                          letterSpacing: 0 }}>{i+1}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 3, fontSize: 9, color: "#94a3b8" }}>
+                    <span>T1 ≤${t.boundaries[0]}</span>
+                    <span>T5 ≤${t.boundaries[4]}</span>
+                    <span>T10 ≤${t.boundaries[9]}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* ── RIGHT: chart ── */}
+        <div style={{ flex: 1, minWidth: 340 }}>
+
+          {/* Pill chips — @ 1x conversion rates for all 10 tiers */}
+          <div style={{ display: "flex", gap: 4, marginBottom: 14, flexWrap: "wrap" }}>
+            {TIERS.map(t => {
+              const p = sigmoid(1.0, t.maxConv, t.k, t.mid);
+              return (
+                <div key={t.index} style={{ background: t.color + "18", border: `1px solid ${t.color}50`,
+                  borderRadius: 6, padding: "3px 8px", fontSize: 10 }}>
+                  <span style={{ color: t.color, fontWeight: 700 }}>{t.label}</span>
+                  <span style={{ color: "#64748b" }}> </span>
+                  <span style={{ fontFamily: "monospace", fontWeight: 800, color: "#0f172a" }}>
+                    {(p * 100).toFixed(2)}%
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+
+          <svg ref={svgRef} viewBox={`0 0 ${CW} ${CH}`}
+            style={{ width: "100%", borderRadius: 10, background: "#f8fafc", cursor: "crosshair" }}
+            onMouseMove={handleSvgMove} onMouseLeave={() => setHoverRatio(null)}>
+
+            <defs>
+              <clipPath id="chart-area">
+                <rect x={PAD.left} y={PAD.top} width={INNER_W} height={INNER_H} />
+              </clipPath>
+            </defs>
+
+            {/* Grid */}
+            {yTicks.map(p => (
+              <g key={p}>
+                <line x1={PAD.left} x2={PAD.left + INNER_W} y1={probToY(p)} y2={probToY(p)}
+                  stroke="#e2e8f0" strokeWidth={1} />
+                <text x={PAD.left - 8} y={probToY(p) + 4} textAnchor="end"
+                  fontSize={10} fill="#94a3b8">{(p * 100).toFixed(0)}%</text>
+              </g>
+            ))}
+            {xTicks.map(r => (
+              <g key={r}>
+                <line x1={ratioToX(r)} x2={ratioToX(r)} y1={PAD.top} y2={PAD.top + INNER_H}
+                  stroke={r === 1.0 ? "#cbd5e1" : "#e2e8f0"}
+                  strokeWidth={r === 1.0 ? 1.5 : 1}
+                  strokeDasharray={r === 1.0 ? "4,3" : "none"} />
+                <text x={ratioToX(r)} y={PAD.top + INNER_H + 16}
+                  textAnchor="middle" fontSize={10} fill="#94a3b8">{r.toFixed(1)}x</text>
+              </g>
+            ))}
+
+            <text x={ratioToX(1.0)} y={PAD.top - 6} textAnchor="middle"
+              fontSize={9} fill="#94a3b8" fontStyle="italic">offer = fare paid</text>
+
+            {/* Curves — 10 tiers */}
+            {TIERS.map(t => (
+              <path key={t.index} d={buildPath(t)} fill="none" clipPath="url(#chart-area)"
+                stroke={t.color} strokeWidth={2} strokeLinecap="round" opacity={0.85} />
+            ))}
+
+            {hoverRatio !== null && (() => {
+              const dots = TIERS.map(t => ({
+                t, p: sigmoid(hoverRatio, t.maxConv, t.k, t.mid)
+              })).sort((a, b) => b.p - a.p);
+              return (
+                <g>
+                  <line x1={ratioToX(hoverRatio)} x2={ratioToX(hoverRatio)}
+                    y1={PAD.top} y2={PAD.top + INNER_H}
+                    stroke="#334155" strokeWidth={1} strokeDasharray="3,3" />
+                  {dots.map(({ t, p }, i) => {
+                    const cx = ratioToX(hoverRatio);
+                    const cy = Math.max(PAD.top + 6, Math.min(probToY(p), PAD.top + INNER_H - 6));
+                    const labelY = PAD.top + 12 + i * 15;
+                    return (
+                      <g key={t.index}>
+                        <circle cx={cx} cy={cy} r={3} fill={t.color} stroke="#fff" strokeWidth={1} />
+                        <rect x={cx + 6} y={labelY - 9} width={48} height={12} rx={2}
+                          fill="#0f172a" opacity={0.88} />
+                        <text x={cx + 30} y={labelY} textAnchor="middle"
+                          fontSize={9} fill="#fff" fontFamily="monospace">
+                          {t.label} {(p*100).toFixed(2)}%
+                        </text>
+                      </g>
+                    );
+                  })}
+                  <rect x={ratioToX(hoverRatio) - 22} y={PAD.top + INNER_H + 22}
+                    width={44} height={16} rx={4} fill="#0f172a" />
+                  <text x={ratioToX(hoverRatio)} y={PAD.top + INNER_H + 34}
+                    textAnchor="middle" fontSize={10} fill="#fff" fontFamily="monospace">
+                    {hoverRatio.toFixed(2)}x
+                  </text>
+                </g>
+              );
+            })()}
+
+            {/* Axis labels */}
+            <text x={PAD.left + INNER_W / 2} y={CH - 4} textAnchor="middle"
+              fontSize={11} fill="#64748b" fontWeight="600">
+              Offer Ratio (Offer / Fare Paid)
+            </text>
+            <text x={14} y={PAD.top + INNER_H / 2} textAnchor="middle"
+              fontSize={11} fill="#64748b" fontWeight="600"
+              transform={`rotate(-90, 14, ${PAD.top + INNER_H / 2})`}>
+              P(Convert)
+            </text>
+          </svg>
+
+          {/* Legend — compact gradient strip */}
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10 }}>
+            <span style={{ fontSize: 11, color: "#64748b", fontWeight: 600 }}>T1 (lowest fare)</span>
+            <div style={{ display: "flex", flex: 1, height: 8, borderRadius: 4, overflow: "hidden" }}>
+              {TIERS.map(t => (
+                <div key={t.index} style={{ flex: 1, background: t.color }} />
+              ))}
+            </div>
+            <span style={{ fontSize: 11, color: "#64748b", fontWeight: 600 }}>T10 (highest fare)</span>
+          </div>
+
+          <div style={{ marginTop: 12, padding: "10px 14px", background: "#fffbeb",
+            borderRadius: 8, border: "1px solid #fcd34d", fontSize: 11, color: "#78350f", lineHeight: 1.6 }}>
+            <strong>Formula:</strong> P(convert) = maxConv / (1 + e<sup>−k·(ratio − inflection)</sup>)
+            &nbsp;· Tier assigned per leg based on where fare paid falls in that leg's dynamic buckets.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+const ALL_ITINERARIES = [
+  // Single-leg
+  { id: "LAXDFW",        legs: ["LAXDFW"] },
+  { id: "ABQDFW",        legs: ["ABQDFW"] },
+  { id: "DFWBOS",        legs: ["DFWBOS"] },
+  { id: "DFWEZE",        legs: ["DFWEZE"] },
+  { id: "DFWAUS",        legs: ["DFWAUS"] },
+  // Two-leg via DFW
+  { id: "LAXDFW-DFWBOS", legs: ["LAXDFW","DFWBOS"] },
+  { id: "LAXDFW-DFWEZE", legs: ["LAXDFW","DFWEZE"] },
+  { id: "LAXDFW-DFWAUS", legs: ["LAXDFW","DFWAUS"] },
+  { id: "ABQDFW-DFWBOS", legs: ["ABQDFW","DFWBOS"] },
+  { id: "ABQDFW-DFWEZE", legs: ["ABQDFW","DFWEZE"] },
+  { id: "ABQDFW-DFWAUS", legs: ["ABQDFW","DFWAUS"] },
+];
+
+function StepBadge({ n, active, done }) {
+  return (
+    <div style={{
+      width: 28, height: 28, borderRadius: "50%", flexShrink: 0,
+      display: "flex", alignItems: "center", justifyContent: "center",
+      fontSize: 13, fontWeight: 800,
+      background: done ? "#059669" : active ? "#0f172a" : "#e2e8f0",
+      color: done || active ? "#fff" : "#94a3b8",
+    }}>
+      {done ? "✓" : n}
+    </div>
+  );
+}
+
+function OfferCalculator({ flights, thresholds }) {
+  const [itinerary,  setItinerary]  = useState(null);
+  const [flightMap,  setFlightMap]  = useState({});
+  const [farePaid,   setFarePaid]   = useState("");
+  const [realCost,   setRealCost]   = useState(0.80);
+  const [minROI,     setMinROI]     = useState(0.40);
+  const [baseOffer,  setBaseOffer]  = useState(false);
+  const [ervRatio,   setErvRatio]   = useState(1.00);
+
+  // Which legs need a flight selected
+  const legs = itinerary?.legs ?? [];
+
+  // Step completion flags
+  const step1done = itinerary !== null;
+  const step2done = step1done && legs.every(l => flightMap[l]);
+  const step3done = step2done && farePaid !== "" && Number(farePaid) > 0;
+
+  // When itinerary changes, reset downstream
+  function handleItinerary(itin) {
+    setItinerary(itin);
+    setFlightMap({});
+    setFarePaid("");
+  }
+
+  // Get flights for a given leg, sorted by status priority
+  function flightsForLeg(legId) {
+    return flights
+      .filter(f => f.leg === legId)
+      .sort((a, b) => statusOrder.indexOf(a.status) - statusOrder.indexOf(b.status));
+  }
+
+  const stepLabelStyle = { fontSize: 13, fontWeight: 700, color: "#0f172a", marginBottom: 12 };
+  const stepSubStyle   = { fontSize: 11, color: "#64748b", marginBottom: 12, marginTop: -8 };
+
+  return (
+    <div style={{ marginTop: 24, background: "#fff", borderRadius: 16,
+      boxShadow: "0 1px 6px #0002", overflow: "hidden" }}>
+
+      {/* Header */}
+      <div style={{ background: "#0f172a", padding: "16px 22px", display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ fontSize: 18, fontWeight: 800, color: "#fff", letterSpacing: "-0.01em" }}>
+          🎫 Offer Calculator
+        </div>
+        <div style={{ fontSize: 12, color: "#64748b" }}>Step-by-step PNR setup</div>
+      </div>
+
+      <div style={{ padding: "24px 22px", display: "flex", flexDirection: "column", gap: 28 }}>
+
+        {/* ── STEP 1: Itinerary ── */}
+        <div style={{ display: "flex", gap: 16, alignItems: "flex-start" }}>
+          <StepBadge n={1} active={!step1done} done={step1done} />
+          <div style={{ flex: 1 }}>
+            <div style={stepLabelStyle}>Select Itinerary</div>
+            <p style={stepSubStyle}>All possible O&D combinations across the 5 simulated legs</p>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+              {ALL_ITINERARIES.map(itin => {
+                const isSelected = itinerary?.id === itin.id;
+                const isMulti    = itin.legs.length > 1;
+                return (
+                  <button key={itin.id} onClick={() => handleItinerary(itin)} style={{
+                    padding: "8px 14px", borderRadius: 8, fontSize: 12, fontWeight: 700,
+                    fontFamily: "monospace", cursor: "pointer", border: "2px solid",
+                    background: isSelected ? "#0f172a" : "#f8fafc",
+                    color:      isSelected ? "#fff"    : "#334155",
+                    borderColor:isSelected ? "#0f172a" : "#e2e8f0",
+                    transition: "all 0.15s",
+                  }}>
+                    {itin.id}
+                    {isMulti && (
+                      <span style={{ marginLeft: 6, fontSize: 10, fontWeight: 600,
+                        color: isSelected ? "#94a3b8" : "#94a3b8" }}>
+                        ({itin.legs.length} legs)
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+            {itinerary && (
+              <div style={{ marginTop: 10, display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                {itinerary.legs.map((leg, i) => {
+                  const legData = LEGS.find(l => l.id === leg);
+                  return (
+                    <span key={leg} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      {i > 0 && <span style={{ color: "#94a3b8" }}>→</span>}
+                      <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 6,
+                        background: "#f1f5f9", color: "#0f172a", fontFamily: "monospace" }}>
+                        {leg} <span style={{ fontWeight: 400, color: "#64748b" }}>{legData?.kms.toLocaleString()} km</span>
+                      </span>
+                    </span>
+                  );
+                })}
+                <span style={{ fontSize: 11, color: "#64748b", marginLeft: 4 }}>
+                  Total: <strong>{itinerary.legs.reduce((s,l) => s + (LEGS.find(x=>x.id===l)?.kms??0), 0).toLocaleString()} km</strong>
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Divider */}
+        <div style={{ height: 1, background: "#f1f5f9" }} />
+
+        {/* ── STEP 2: Flight per leg ── */}
+        <div style={{ display: "flex", gap: 16, alignItems: "flex-start" }}>
+          <StepBadge n={2} active={step1done && !step2done} done={step2done} />
+          <div style={{ flex: 1 }}>
+            <div style={{ ...stepLabelStyle, color: step1done ? "#0f172a" : "#94a3b8" }}>
+              Select Flight{legs.length > 1 ? "s" : ""} per Leg
+            </div>
+            <p style={stepSubStyle}>
+              {step1done ? "Pick the specific flight the passenger is booked on" : "Complete Step 1 first"}
+            </p>
+            {step1done && (
+              <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+                {legs.map(legId => (
+                  <div key={legId} style={{ flex: 1, minWidth: 220 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", marginBottom: 8,
+                      letterSpacing: "0.06em" }}>
+                      {legId}
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {flightsForLeg(legId).map(f => {
+                        const isSelected = flightMap[legId] === f.id;
+                        return (
+                          <button key={f.id} onClick={() => setFlightMap(m => ({ ...m, [legId]: f.id }))}
+                            style={{
+                              padding: "9px 12px", borderRadius: 8, cursor: "pointer",
+                              border: `2px solid ${isSelected ? f.color : "#e2e8f0"}`,
+                              background: isSelected ? f.bg : "#f8fafc",
+                              textAlign: "left", transition: "all 0.15s",
+                              display: "flex", justifyContent: "space-between", alignItems: "center",
+                            }}>
+                            <span style={{ fontFamily: "monospace", fontWeight: 800, fontSize: 12,
+                              color: isSelected ? f.color : "#334155" }}>{f.id}</span>
+                            <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px",
+                              borderRadius: 999, background: f.bg, color: f.color,
+                              border: `1px solid ${f.color}40` }}>
+                              {f.status.replace(/_/g," ")}
+                            </span>
+                            <span style={{ fontSize: 11, color: "#64748b", fontFamily: "monospace" }}>
+                              Prob {(f.soldOutProb * 100).toFixed(0)}%
+                            </span>
+                            <span style={{ fontSize: 11, fontWeight: 700, color: "#059669", fontFamily: "monospace" }}>
+                              MV ${f.marketValue.toFixed(0)}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Divider */}
+        <div style={{ height: 1, background: "#f1f5f9" }} />
+
+        {/* ── STEP 3: Fare Paid ── */}
+        <div style={{ display: "flex", gap: 16, alignItems: "flex-start" }}>
+          <StepBadge n={3} active={step2done && !step3done} done={step3done} />
+          <div style={{ flex: 1 }}>
+            <div style={{ ...stepLabelStyle, color: step2done ? "#0f172a" : "#94a3b8" }}>
+              Fare Paid by Passenger
+            </div>
+            <p style={stepSubStyle}>
+              {step2done ? "Total amount the passenger originally paid for this itinerary" : "Complete Step 2 first"}
+            </p>
+            {step2done && (
+              <div style={{ display: "flex", alignItems: "center", gap: 10, maxWidth: 260 }}>
+                <span style={{ fontSize: 22, fontWeight: 700, color: "#64748b" }}>$</span>
+                <input
+                  type="number" min={0} step={1}
+                  placeholder="e.g. 150"
+                  value={farePaid}
+                  onChange={e => setFarePaid(e.target.value)}
+                  style={{
+                    flex: 1, padding: "10px 14px", borderRadius: 10, fontSize: 18,
+                    fontWeight: 800, fontFamily: "monospace", color: "#0f172a",
+                    border: `2px solid ${step3done ? "#059669" : "#e2e8f0"}`,
+                    background: "#f8fafc", outline: "none",
+                  }}
+                />
+                {step3done && (
+                  <span style={{ fontSize: 20 }}>✅</span>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* ── OFFER RESULTS when all steps done ── */}
+        {step3done && (
+          <>
+            <div style={{ height: 1, background: "#f1f5f9" }} />
+            <OfferResults
+              itinerary={itinerary}
+              flightMap={flightMap}
+              farePaid={Number(farePaid)}
+              flights={flights}
+              thresholds={thresholds}
+              realCost={realCost}
+              minROI={minROI}
+              setRealCost={setRealCost}
+              setMinROI={setMinROI}
+              baseOffer={baseOffer}
+              setBaseOffer={setBaseOffer}
+              ervRatio={ervRatio}
+              setErvRatio={setErvRatio}
+            />
+          </>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+// ─── OFFER ENGINE ─────────────────────────────────────────────────────────────
+function computeOfferForLeg({ flight, farePaid, realCost, minROI, thresholds, ervRatio }) {
+  const mv  = flight.marketValue;
+  const erv = mv * ervRatio;          // Expected Resale Value — used in margin & optimal
+  const sop = flight.soldOutProb;
+  const RC  = realCost;
+  const maxPrice = mv * 0.90;         // Max Price always uses MV
+
+  const tierIdx = getFareTierIndex(farePaid, flight.leg, thresholds);
+  const tier    = TIERS[tierIdx];
+
+  const offerMin = farePaid * 0.5;
+  const offerMax = farePaid * 5.0;
+  const steps    = 500;
+  const stepSize = (offerMax - offerMin) / steps;
+
+  let bestOffer  = null;
+  let bestProfit = -Infinity;
+
+  for (let i = 0; i <= steps; i++) {
+    const offer  = offerMin + i * stepSize;
+    const ratio  = offer / farePaid;
+    const expectedMargin = erv * sop - offer * RC;
+    const roi    = expectedMargin / (offer * RC);
+    if (roi < minROI) continue;
+    const pConvert       = sigmoid(ratio, tier.maxConv, tier.k, tier.mid);
+    const expectedProfit = pConvert * expectedMargin;
+    if (expectedProfit > bestProfit) {
+      bestProfit = expectedProfit;
+      bestOffer  = { offer, ratio, expectedMargin, roi, pConvert, expectedProfit };
+    }
+  }
+
+  // Fallback: if no offer passed the ROI filter in the 0.5x–5.0x range,
+  // compute the breakeven offer where ROI = minROI exactly:
+  //   offer = ERV×SOP / (RC × (1 + minROI))
+  if (!bestOffer) {
+    const fallbackOffer  = (erv * sop) / (RC * (1 + minROI));
+    const ratio          = fallbackOffer / farePaid;
+    const expectedMargin = erv * sop - fallbackOffer * RC;
+    const roi            = expectedMargin / (fallbackOffer * RC);
+    const pConvert       = sigmoid(ratio, tier.maxConv, tier.k, tier.mid);
+    const expectedProfit = pConvert * expectedMargin;
+    bestOffer = { offer: fallbackOffer, ratio, expectedMargin, roi, pConvert, expectedProfit, isFallback: true };
+  }
+
+  const capped = bestOffer.offer > maxPrice;
+  const finalOffer = { ...bestOffer, offer: Math.min(bestOffer.offer, maxPrice), capped };
+
+  return { mv, erv, sop, maxPrice, RC, minROI, tier, tierIdx, optimal: finalOffer, noValidOffer: false };
+}
+
+// ─── FORMULA ROW ──────────────────────────────────────────────────────────────
+function FormulaRow({ label, formula, value, color }) {
+  return (
+    <div style={{ display:"flex", alignItems:"baseline", gap:8, padding:"5px 0",
+      borderBottom:"1px solid #f1f5f9", flexWrap:"wrap" }}>
+      <span style={{ fontSize:11, fontWeight:700, color:"#64748b", minWidth:160 }}>{label}</span>
+      <code style={{ fontSize:10, color:"#475569", background:"#f8fafc",
+        padding:"1px 6px", borderRadius:4, flex:1, fontFamily:"monospace" }}>{formula}</code>
+      <span style={{ fontSize:13, fontWeight:800, color:color||"#0f172a",
+        fontFamily:"monospace", minWidth:80, textAlign:"right" }}>{value}</span>
+    </div>
+  );
+}
+
+// ─── LEG OFFER CARD ───────────────────────────────────────────────────────────
+function LegOfferCard({ legId, flight, farePaid, result }) {
+  // Ineligible leg — show $0 card
+  if (!result.eligible) {
+    return (
+      <div style={{ flex:1, minWidth:280, background:"#f8fafc", borderRadius:12,
+        border:"2px solid #e2e8f0", overflow:"hidden" }}>
+        <div style={{ background:"#f1f5f9", padding:"10px 14px",
+          display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+          <div>
+            <span style={{ fontFamily:"monospace", fontWeight:800, fontSize:13, color:"#0f172a" }}>{legId}</span>
+            <span style={{ marginLeft:8, fontSize:11, color:"#64748b" }}>
+              {flight.id} · <span style={{ color:flight.color, fontWeight:700 }}>{flight.status.replace(/_/g," ")}</span>
+            </span>
+          </div>
+          <span style={{ fontSize:18 }}>➖</span>
+        </div>
+        <div style={{ padding:"16px 14px", display:"flex", flexDirection:"column", gap:8 }}>
+          <div style={{ fontSize:11, color:"#64748b", lineHeight:1.6 }}>
+            This flight is <strong>{flight.status.replace(/_/g," ")}</strong> — Base Offer is <strong>OFF</strong>,
+            so offers are only generated for <strong>FULL</strong> and <strong>POTENTIAL SPILL</strong> flights.
+            Toggle Base Offer ON to include this leg.
+          </div>
+          <div style={{ background:"#f1f5f9", borderRadius:8, padding:"10px 14px",
+            display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <span style={{ fontSize:11, color:"#94a3b8", fontWeight:600 }}>LEG OFFER</span>
+            <span style={{ fontSize:22, fontWeight:900, color:"#94a3b8", fontFamily:"monospace" }}>$0.00</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const o = result.optimal;
+  const noOffer = result.noValidOffer;
+  const borderColor = noOffer ? "#fca5a5" : o?.capped ? "#fcd34d" : "#86efac";
+  const headerBg    = noOffer ? "#fef2f2" : o?.capped ? "#fffbeb" : "#f0fdf4";
+
+  return (
+    <div style={{ flex:1, minWidth:280, background:"#f8fafc", borderRadius:12,
+      border:`2px solid ${borderColor}`, overflow:"hidden" }}>
+
+      <div style={{ background:headerBg, padding:"10px 14px",
+        display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <div>
+          <span style={{ fontFamily:"monospace", fontWeight:800, fontSize:13, color:"#0f172a" }}>{legId}</span>
+          <span style={{ marginLeft:8, fontSize:11, color:"#64748b" }}>
+            {flight.id} · <span style={{ color:flight.color, fontWeight:700 }}>{flight.status.replace(/_/g," ")}</span>
+          </span>
+        </div>
+        <span style={{ fontSize:18 }}>{noOffer?"🚫":o?.capped?"⚠️":"✅"}</span>
+      </div>
+
+      <div style={{ padding:"12px 14px" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:10 }}>
+          <div style={{ width:10, height:10, borderRadius:"50%", background:result.tier.color }} />
+          <span style={{ fontSize:11, color:"#64748b" }}>
+            Fare tier <strong style={{ color:result.tier.color }}>{result.tier.label}</strong>
+            <span style={{ color:"#94a3b8" }}> (T{result.tierIdx+1}/10) · leg fare ${farePaid.toFixed(2)}</span>
+          </span>
+        </div>
+
+        <FormulaRow label="Market Value"  formula="avg √ProRatio last 5 PAX" value={`$${result.mv.toFixed(2)}`} />
+        <FormulaRow label="ERV"           formula={`MV × ${result.erv !== result.mv ? (result.erv/result.mv).toFixed(2)+"x" : "1.00x"}`} value={`$${result.erv.toFixed(2)}`} color="#059669" />
+        <FormulaRow label="Sold-Out Prob" formula="P(flight sells out)"       value={`${(result.sop*100).toFixed(1)}%`} />
+        <FormulaRow label="Max Price"     formula="MV × 90%"                  value={`$${result.maxPrice.toFixed(2)}`} color="#f97316" />
+
+        {noOffer ? (
+          <div style={{ marginTop:8, padding:"8px 10px", background:"#fef2f2",
+            borderRadius:8, fontSize:11, color:"#b91c1c" }}>
+            No valid offer — all levels below min ROI {(result.minROI*100).toFixed(0)}%. Lower min ROI or check market value.
+          </div>
+        ) : (
+          <>
+            <FormulaRow label="Optimal Offer" formula="" value={`$${o.offer.toFixed(2)}`} color="#059669" />
+            {o.capped && (
+              <div style={{ marginTop:8, padding:"7px 10px", background:"#fffbeb",
+                borderRadius:8, fontSize:11, color:"#92400e" }}>
+                ⚠️ Raw optimal capped to Max Price ${result.maxPrice.toFixed(2)}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── OFFER RESULTS ────────────────────────────────────────────────────────────
+function OfferResults({ itinerary, flightMap, farePaid, flights, thresholds,
+  realCost, minROI, setRealCost, setMinROI, baseOffer, setBaseOffer, ervRatio, setErvRatio }) {
+
+  const ELIGIBLE_STATUSES = ["FULL", "POTENTIAL_SPILL"];
+
+  const legFares = useMemo(() => {
+    const legIds = itinerary.legs;
+    return Object.fromEntries(legIds.map(legId => [legId, farePaid * sqrtProRatio(legId, legIds)]));
+  }, [itinerary, farePaid]);
+
+  const legResults = useMemo(() => {
+    return Object.fromEntries(itinerary.legs.map(legId => {
+      const flight = flights.find(f => f.id === flightMap[legId]);
+      if (!flight) return [legId, null];
+      const eligible = baseOffer || ELIGIBLE_STATUSES.includes(flight.status);
+      if (!eligible) return [legId, { eligible: false, finalOffer: 0, flight }];
+      const res = computeOfferForLeg({ flight, farePaid: legFares[legId], realCost, minROI, thresholds, ervRatio });
+      const finalOffer = res.optimal ? res.optimal.offer : 0;
+      return [legId, { eligible: true, finalOffer, ...res }];
+    }));
+  }, [itinerary, flightMap, farePaid, legFares, realCost, minROI, thresholds, flights, baseOffer, ervRatio]);
+
+  const pnrTotalOffer = useMemo(() =>
+    itinerary.legs.reduce((s, l) => s + (legResults[l]?.finalOffer ?? 0), 0),
+  [legResults, itinerary]);
+
+  return (
+    <div>
+      {/* Global params */}
+      <div style={{ background:"#f8fafc", borderRadius:12, padding:"14px 18px", marginBottom:20,
+        display:"flex", gap:24, flexWrap:"wrap", alignItems:"center", border:"1px solid #e2e8f0" }}>
+        <div style={{ fontSize:11, fontWeight:700, color:"#64748b", letterSpacing:"0.06em", whiteSpace:"nowrap" }}>GLOBAL PARAMETERS</div>
+
+        {/* RC */}
+        <div style={{ minWidth:160 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:3 }}>
+            <span style={{ color:"#64748b", fontWeight:600 }}>Real Cost (RC)</span>
+            <span style={{ fontFamily:"monospace", fontWeight:800 }}>{(realCost*100).toFixed(0)}%</span>
+          </div>
+          <input type="range" min={0.50} max={0.99} step={0.01} value={realCost}
+            onChange={e => setRealCost(Number(e.target.value))}
+            style={{ width:"100%", accentColor:"#0284c7" }} />
+          <div style={{ display:"flex", justifyContent:"space-between", fontSize:9, color:"#94a3b8" }}>
+            <span>50%</span><span>99%</span>
+          </div>
+        </div>
+
+        {/* Min ROI */}
+        <div style={{ minWidth:160 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:3 }}>
+            <span style={{ color:"#64748b", fontWeight:600 }}>Min ROI</span>
+            <span style={{ fontFamily:"monospace", fontWeight:800 }}>{(minROI*100).toFixed(0)}%</span>
+          </div>
+          <input type="range" min={0.05} max={2.00} step={0.05} value={minROI}
+            onChange={e => setMinROI(Number(e.target.value))}
+            style={{ width:"100%", accentColor:"#7c3aed" }} />
+          <div style={{ display:"flex", justifyContent:"space-between", fontSize:9, color:"#94a3b8" }}>
+            <span>5%</span><span>200%</span>
+          </div>
+        </div>
+
+        {/* ERV/MV */}
+        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          <span style={{ fontSize:11, fontWeight:600, color:"#64748b", whiteSpace:"nowrap" }}>ERV / MV</span>
+          <input
+            type="number" min={0.10} max={5.00} step={0.05} value={ervRatio}
+            onChange={e => setErvRatio(Math.max(0.1, Number(e.target.value)))}
+            style={{
+              width:70, padding:"4px 8px", borderRadius:8, fontSize:14,
+              fontWeight:800, fontFamily:"monospace", color:"#0f172a",
+              border:"2px solid #e2e8f0", background:"#fff", textAlign:"center",
+            }}
+          />
+          <span style={{ fontSize:12, fontWeight:700, color:"#64748b" }}>x</span>
+        </div>
+
+        {/* Base Offer toggle */}
+        {(() => {
+          const hasHighStatusLeg = itinerary.legs.some(l => {
+            const f = flights.find(fl => fl.id === flightMap[l]);
+            return f && (f.status === "FULL" || f.status === "POTENTIAL_SPILL");
+          });
+          const canToggle = hasHighStatusLeg;
+          // Auto-disable if no high status leg
+          if (!canToggle && baseOffer) setBaseOffer(false);
+          return (
+            <div style={{ display:"flex", alignItems:"center", gap:8, marginLeft:"auto" }}>
+              <span style={{ fontSize:11, fontWeight:700, color: canToggle ? "#64748b" : "#cbd5e1", letterSpacing:"0.06em" }}>BASE OFFER</span>
+              <div onClick={() => canToggle && setBaseOffer(b => !b)} style={{
+                width:44, height:24, borderRadius:12,
+                cursor: canToggle ? "pointer" : "not-allowed", position:"relative",
+                background: !canToggle ? "#e2e8f0" : baseOffer ? "#059669" : "#94a3b8",
+                transition:"background 0.2s", flexShrink:0, opacity: canToggle ? 1 : 0.5,
+              }}>
+                <div style={{
+                  position:"absolute", top:3, left: baseOffer && canToggle ? 23 : 3,
+                  width:18, height:18, borderRadius:"50%", background:"#fff",
+                  transition:"left 0.2s", boxShadow:"0 1px 3px #0004",
+                }} />
+              </div>
+              <div style={{ display:"flex", flexDirection:"column", gap:1 }}>
+                <span style={{ fontSize:12, fontWeight:800, color: !canToggle ? "#cbd5e1" : baseOffer ? "#059669" : "#94a3b8", minWidth:32 }}>
+                  {!canToggle ? "N/A" : baseOffer ? "ON" : "OFF"}
+                </span>
+                {!canToggle && (
+                  <span style={{ fontSize:9, color:"#94a3b8", whiteSpace:"nowrap" }}>needs FULL or SPILL</span>
+                )}
+              </div>
+            </div>
+          );
+        })()}
+      </div>
+
+      {/* Per-leg cards — hidden in share version */}
+
+
+
+      {/* ── PNR TOTAL OFFER ── */}
+      <div style={{ marginTop:16, background:"#0f172a", borderRadius:12, padding:"18px 24px",
+        display:"flex", justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:16 }}>
+        <div>
+          <div style={{ fontSize:11, fontWeight:700, color:"#64748b", letterSpacing:"0.08em", marginBottom:4 }}>
+            PNR TOTAL OFFER
+          </div>
+          <div style={{ fontSize:11, color:"#475569", lineHeight:1.6 }}>
+            {itinerary.legs.map(l => {
+              const r = legResults[l];
+              const flight = flights.find(f => f.id === flightMap[l]);
+              // Determine which algorithm won
+              let algoLabel = "ZERO OFFER";
+              let algoColor = "#475569";
+              if (r?.eligible && r.optimal) {
+                if (r.optimal.capped) { algoLabel = "MAX PRICE"; algoColor = "#f97316"; }
+                else if (r.optimal.isFallback) { algoLabel = "FALLBACK · MIN ROI"; algoColor = "#0284c7"; }
+                else { algoLabel = "OPTIMAL OFFER"; algoColor = "#059669"; }
+              } else if (r?.eligible && r.noValidOffer) {
+                algoLabel = "NO VALID OFFER"; algoColor = "#ef4444";
+              }
+              return (
+                <span key={l} style={{ marginRight:20, display:"inline-flex", flexDirection:"column", gap:1 }}>
+                  <span>
+                    <span style={{ color:"#64748b" }}>{l}:</span>{" "}
+                    {r?.eligible
+                      ? <span style={{ color:"#34d399", fontFamily:"monospace", fontWeight:700 }}>${r.finalOffer.toFixed(2)}</span>
+                      : <span style={{ color:"#475569", fontFamily:"monospace" }}>$0.00 <span style={{ fontSize:10 }}>(no offer)</span></span>
+                    }
+                  </span>
+                  {flight && (
+                    <span style={{ fontSize:10, fontWeight:700, color:flight.color, letterSpacing:"0.04em" }}>
+                      {flight.status.replace(/_/g," ")}
+                    </span>
+                  )}
+                  <span style={{ fontSize:10, fontWeight:700, color:algoColor, letterSpacing:"0.04em" }}>
+                    {algoLabel}
+                  </span>
+                </span>
+              );
+            })}
+          </div>
+        </div>
+        <div style={{ textAlign:"right" }}>
+          <div style={{ fontSize:11, color:"#64748b", marginBottom:2 }}>Sum of eligible leg offers</div>
+          <div style={{ fontSize:36, fontWeight:900, color:"#34d399", fontFamily:"monospace", letterSpacing:"-0.02em" }}>
+            ${pnrTotalOffer.toFixed(2)}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ marginTop:10, padding:"10px 14px", background:"#fffbeb",
+        borderRadius:8, border:"1px solid #fcd34d", fontSize:11, color:"#78350f", lineHeight:1.8 }}>
+        <strong>Engine:</strong>
+        {" "}Offers only on FULL / POTENTIAL SPILL legs · others = $0
+        {" · "}Exp_Margin = MV×SOP − Offer×RC
+        {" · "}ROI ≥ minROI filter
+        {" · "}Optimal = argmax P(conv)×Margin
+        {" · "}Final = min(Optimal, MV×90%)
+        {" · "}PNR Offer = Σ Final Offers across legs
+      </div>
+
+      {/* ── SWAP OFFERS ── */}
+      <SwapOffers
+        itinerary={itinerary}
+        flights={flights}
+        flightMap={flightMap}
+        pnrTotalOffer={pnrTotalOffer}
+      />
+    </div>
+  );
+}
+
+// ─── SWAP OFFER ENGINE ────────────────────────────────────────────────────────
+// For the passenger's itinerary (same legs / same O&D), find all combinations
+// of POTENTIAL_SPOILAGE flights (one per leg, different from current booking)
+// and compute swap_reward = pnrTotalOffer - new_flight_costs
+// new_flight_costs = Σ (soldOutProb × marketValue) for each replacement leg flight
+
+function computeSwapOptions({ itinerary, flights, flightMap, pnrTotalOffer }) {
+  const legs = itinerary.legs;
+
+  // For each leg, collect POTENTIAL_SPOILAGE flights that are NOT the currently booked flight
+  const spoilagePerLeg = legs.map(legId => {
+    const currentFlightId = flightMap[legId];
+    return flights.filter(f =>
+      f.leg === legId &&
+      f.status === "POTENTIAL_SPOILAGE" &&
+      f.id !== currentFlightId
+    );
+  });
+
+  // Check if any leg has no spoilage alternatives → no swaps possible
+  if (spoilagePerLeg.some(opts => opts.length === 0)) return [];
+
+  // Build all combinations (cartesian product across legs)
+  function cartesian(arrays) {
+    return arrays.reduce((acc, arr) =>
+      acc.flatMap(combo => arr.map(item => [...combo, item])),
+      [[]]
+    );
+  }
+
+  const combinations = cartesian(spoilagePerLeg);
+
+  // Score each combination
+  return combinations.map(combo => {
+    const newFlightCost = combo.reduce((s, f) => s + f.soldOutProb * f.marketValue, 0);
+    const swapReward    = pnrTotalOffer - newFlightCost;
+    return {
+      legs: combo.map((f, i) => ({
+        legId:       legs[i],
+        flight:      f,
+        legCost:     f.soldOutProb * f.marketValue,
+      })),
+      newFlightCost,
+      swapReward,
+    };
+  }).sort((a, b) => b.swapReward - a.swapReward).filter(s => s.swapReward > 0);
+}
+
+// ─── SWAP OFFERS PANEL ───────────────────────────────────────────────────────
+function SwapOffers({ itinerary, flights, flightMap, pnrTotalOffer }) {
+  const swaps = useMemo(() =>
+    computeSwapOptions({ itinerary, flights, flightMap, pnrTotalOffer }),
+    [itinerary, flights, flightMap, pnrTotalOffer]
+  );
+
+  const hasOffer = pnrTotalOffer > 0;
+  const noSwaps  = swaps.length === 0;
+
+  return (
+    <div style={{ marginTop:16, background:"#fff", borderRadius:16,
+      boxShadow:"0 1px 6px #0002", overflow:"hidden" }}>
+
+      {/* Header */}
+      <div style={{ background:"#1e293b", padding:"14px 22px", display:"flex", alignItems:"center", gap:12 }}>
+        <div style={{ fontSize:17, fontWeight:800, color:"#fff" }}>🔄 Swap Offers</div>
+        <div style={{ fontSize:12, color:"#64748b" }}>
+          Same O&D · replacement on POTENTIAL SPOILAGE flights only
+        </div>
+        {hasOffer && (
+          <div style={{ marginLeft:"auto", fontSize:12, color:"#94a3b8" }}>
+            Buyback offer: <span style={{ fontFamily:"monospace", fontWeight:800, color:"#34d399" }}>
+              ${pnrTotalOffer.toFixed(2)}
+            </span>
+          </div>
+        )}
+      </div>
+
+      <div style={{ padding:"18px 22px" }}>
+
+        {!hasOffer && (
+          <div style={{ padding:"14px 16px", background:"#f8fafc", borderRadius:10,
+            fontSize:12, color:"#64748b", border:"1px solid #e2e8f0" }}>
+            No buyback offer calculated — complete the offer above to see swap options.
+          </div>
+        )}
+
+        {hasOffer && noSwaps && (
+          <div style={{ padding:"14px 16px", background:"#fef2f2", borderRadius:10,
+            fontSize:12, color:"#b91c1c", border:"1px solid #fca5a5" }}>
+            🚫 No viable swap found — either no POTENTIAL SPOILAGE flights exist on one or more legs,
+            or all replacement combinations have a negative swap reward (new flight costs exceed the buyback offer).
+          </div>
+        )}
+
+        {hasOffer && !noSwaps && (
+          <>
+            {/* Formula reminder */}
+            <div style={{ padding:"8px 12px", background:"#f0f9ff", borderRadius:8,
+              border:"1px solid #bae6fd", fontSize:11, color:"#0369a1", marginBottom:14 }}>
+              <strong>Swap Reward</strong> = Buyback Offer − New Flight Costs
+              &nbsp;·&nbsp;
+              <strong>New Flight Costs</strong> = Σ (SoldOutProb × MarketValue) per replacement leg
+            </div>
+
+            {/* Swap option cards */}
+            <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+              {swaps.map((swap, idx) => {
+                const positive = swap.swapReward >= 0;
+                return (
+                  <div key={idx} style={{
+                    borderRadius:10, border:`2px solid ${positive ? "#86efac" : "#fca5a5"}`,
+                    background: positive ? "#f0fdf4" : "#fef2f2", overflow:"hidden",
+                  }}>
+                    {/* Card header row */}
+                    <div style={{ padding:"8px 14px", display:"flex",
+                      alignItems:"center", gap:16, flexWrap:"wrap",
+                      borderBottom:`1px solid ${positive ? "#bbf7d0" : "#fecaca"}` }}>
+                      <span style={{ fontSize:11, fontWeight:800, color:"#64748b",
+                        minWidth:24 }}>#{idx+1}</span>
+
+                      {/* Replacement flights */}
+                      {swap.legs.map((l, i) => (
+                        <span key={i} style={{ display:"flex", alignItems:"center", gap:6 }}>
+                          {i > 0 && <span style={{ color:"#94a3b8", fontSize:11 }}>+</span>}
+                          <span style={{ fontFamily:"monospace", fontSize:11, fontWeight:700,
+                            color:"#0f172a" }}>{l.legId}</span>
+                          <span style={{ fontFamily:"monospace", fontSize:11,
+                            color:"#3b82f6", fontWeight:700 }}>{l.flight.id}</span>
+                          <span style={{ fontSize:10, padding:"1px 6px", borderRadius:999,
+                            background:"#eff6ff", color:"#3b82f6",
+                            border:"1px solid #bfdbfe", fontWeight:700 }}>SPOILAGE</span>
+                        </span>
+                      ))}
+
+                      {/* Reward badge */}
+                      <div style={{ marginLeft:"auto", display:"flex", alignItems:"baseline", gap:6 }}>
+                        <span style={{ fontSize:11, color:"#64748b" }}>Swap Reward:</span>
+                        <span style={{ fontFamily:"monospace", fontWeight:900, fontSize:18,
+                          color: positive ? "#059669" : "#dc2626" }}>
+                          {positive ? "+" : ""}${swap.swapReward.toFixed(2)}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Detail row */}
+                    <div style={{ padding:"8px 14px", display:"flex",
+                      gap:24, flexWrap:"wrap", fontSize:11 }}>
+
+                      {/* Per-leg cost breakdown */}
+                      {swap.legs.map((l, i) => (
+                        <div key={i} style={{ display:"flex", flexDirection:"column", gap:2 }}>
+                          <span style={{ fontWeight:700, color:"#64748b",
+                            letterSpacing:"0.05em", fontSize:10 }}>{l.legId} COST</span>
+                          <span style={{ fontFamily:"monospace", color:"#0f172a", fontWeight:700 }}>
+                            ${l.legCost.toFixed(2)}
+                          </span>
+                          <span style={{ fontSize:10, color:"#94a3b8" }}>
+                            {(l.flight.soldOutProb*100).toFixed(0)}% × ${l.flight.marketValue.toFixed(0)}
+                          </span>
+                        </div>
+                      ))}
+
+                      <div style={{ display:"flex", flexDirection:"column", gap:2 }}>
+                        <span style={{ fontWeight:700, color:"#64748b",
+                          letterSpacing:"0.05em", fontSize:10 }}>TOTAL NEW COST</span>
+                        <span style={{ fontFamily:"monospace", color:"#ef4444", fontWeight:700 }}>
+                          −${swap.newFlightCost.toFixed(2)}
+                        </span>
+                      </div>
+
+                      <div style={{ display:"flex", flexDirection:"column", gap:2 }}>
+                        <span style={{ fontWeight:700, color:"#64748b",
+                          letterSpacing:"0.05em", fontSize:10 }}>BUYBACK</span>
+                        <span style={{ fontFamily:"monospace", color:"#34d399", fontWeight:700 }}>
+                          +${pnrTotalOffer.toFixed(2)}
+                        </span>
+                      </div>
+
+                      <div style={{ display:"flex", flexDirection:"column", gap:2,
+                        marginLeft:"auto", textAlign:"right" }}>
+                        <span style={{ fontWeight:700, color:"#64748b",
+                          letterSpacing:"0.05em", fontSize:10 }}>NET REWARD</span>
+                        <span style={{ fontFamily:"monospace", fontWeight:900, fontSize:15,
+                          color: positive ? "#059669" : "#dc2626" }}>
+                          ${swap.swapReward.toFixed(2)}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div style={{ marginTop:10, fontSize:11, color:"#94a3b8" }}>
+              {swaps.length} swap combination{swaps.length !== 1 ? "s" : ""} found · sorted by reward (highest first)
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
