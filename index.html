@@ -865,36 +865,39 @@ function OfferCalculator({ flights, thresholds }) {
               {step1done ? "Pick the specific flight the passenger is booked on" : "Complete Step 1 first"}
             </p>
             {step1done && (
-              <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+              <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
                 {legs.map(legId => (
-                  <div key={legId} style={{ flex: 1, minWidth: 220 }}>
-                    <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", marginBottom: 8,
+                  <div key={legId} style={{ minWidth: 320, maxWidth: 400 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", marginBottom: 6,
                       letterSpacing: "0.06em" }}>
                       {legId}
                     </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                       {flightsForLeg(legId).map(f => {
                         const isSelected = flightMap[legId] === f.id;
                         return (
                           <button key={f.id} onClick={() => setFlightMap(m => ({ ...m, [legId]: f.id }))}
                             style={{
-                              padding: "9px 12px", borderRadius: 8, cursor: "pointer",
+                              padding: "5px 10px", borderRadius: 7, cursor: "pointer",
                               border: `2px solid ${isSelected ? f.color : "#e2e8f0"}`,
                               background: isSelected ? f.bg : "#f8fafc",
                               textAlign: "left", transition: "all 0.15s",
-                              display: "flex", justifyContent: "space-between", alignItems: "center",
+                              display: "grid",
+                              gridTemplateColumns: "56px 1fr 56px 64px",
+                              alignItems: "center", gap: 8,
                             }}>
-                            <span style={{ fontFamily: "monospace", fontWeight: 800, fontSize: 12,
+                            <span style={{ fontFamily: "monospace", fontWeight: 800, fontSize: 11,
                               color: isSelected ? f.color : "#334155" }}>{f.id}</span>
-                            <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px",
+                            <span style={{ fontSize: 9, fontWeight: 700, padding: "1px 6px",
                               borderRadius: 999, background: f.bg, color: f.color,
-                              border: `1px solid ${f.color}40` }}>
+                              border: `1px solid ${f.color}40`, textAlign: "center",
+                              whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                               {f.status.replace(/_/g," ")}
                             </span>
-                            <span style={{ fontSize: 11, color: "#64748b", fontFamily: "monospace" }}>
-                              Prob {(f.soldOutProb * 100).toFixed(0)}%
+                            <span style={{ fontSize: 10, color: "#64748b", fontFamily: "monospace", textAlign: "right" }}>
+                              {(f.soldOutProb * 100).toFixed(0)}%
                             </span>
-                            <span style={{ fontSize: 11, fontWeight: 700, color: "#059669", fontFamily: "monospace" }}>
+                            <span style={{ fontSize: 10, fontWeight: 700, color: "#059669", fontFamily: "monospace", textAlign: "right" }}>
                               MV ${f.marketValue.toFixed(0)}
                             </span>
                           </button>
