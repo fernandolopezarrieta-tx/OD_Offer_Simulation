@@ -358,7 +358,7 @@ function getFareTier(farePaid, legId, thresholds) {
 // ─── MAIN APP ─────────────────────────────────────────────────────────────────
 function App() {
   const [selected, setSelected] = useState(null);
-  const [filterLeg, setFilterLeg] = useState("ALL");
+  const [filterLeg, setFilterLeg] = useState("LAXDFW");
   const [filterStatus, setFilterStatus] = useState("ALL");
   const [sortBy, setSortBy] = useState("leg");
 
@@ -414,8 +414,8 @@ function App() {
       <div style={{ background: "#fff", borderRadius: 12, padding: "14px 18px", marginBottom: 16, display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap", boxShadow: "0 1px 4px #0001" }}>
         <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
           <span style={{ fontSize: 12, color: "#64748b", fontWeight: 600 }}>LEG</span>
-          {["ALL", ...LEGS.map(l => l.id)].map(v => (
-            <button key={v} style={selBtn(v, filterLeg, setFilterLeg)} onClick={() => setFilterLeg(v)}>{v}</button>
+          {LEGS.map(l => (
+            <button key={l.id} style={selBtn(l.id, filterLeg, setFilterLeg)} onClick={() => setFilterLeg(l.id)}>{l.id}</button>
           ))}
         </div>
         <div style={{ display: "flex", gap: 6, alignItems: "center", marginLeft: "auto" }}>
